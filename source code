@@ -1,0 +1,213 @@
+#define F_CPU 8000000UL  // CPU frequency: 8MHz
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+
+// LCD pin definitions
+#define LCD_RS 2
+#define LCD_RW 1
+#define LCD_EN 0
+#define LCD_CTRL_PORT PORTB
+#define LCD_CTRL_DDR  DDRB
+#define LCD_DATA_PORT PORTA
+#define LCD_DATA_DDR  DDRA
+
+// Stopwatch variables
+volatile uint8_t minutes = 0, seconds = 0, hundredths = 0, running = 0, started = 0, update_flag = 1;
+uint8_t last_minutes = 99, last_seconds = 99, last_hundredths = 99;  // Used to detect changes for display update
+
+// Generates enable pulse for LCD
+void lcd_enable(void) {
+	_delay_us(1);
+	LCD_CTRL_PORT |= (1 << LCD_EN);
+	_delay_us(1);
+	LCD_CTRL_PORT &= ~(1 << LCD_EN);
+	_delay_us(40);
+}
+
+// Sends data or command to LCD
+void lcd_send(uint8_t data, uint8_t is_data) {
+	if (is_data)
+	LCD_CTRL_PORT |= (1 << LCD_RS);
+	else
+	LCD_CTRL_PORT &= ~(1 << LCD_RS);
+	LCD_CTRL_PORT &= ~(1 << LCD_RW);
+	// High nibble
+	LCD_DATA_PORT = (LCD_DATA_PORT & 0xF0) | ((data >> 4) & 0x0F);
+	lcd_enable();
+	// Low nibble
+	LCD_DATA_PORT = (LCD_DATA_PORT & 0xF0) | (data & 0x0F);
+	lcd_enable();
+	_delay_us(40);
+}
+
+// Sets LCD cursor position
+void lcd_xy(uint8_t x, uint8_t y) {
+	lcd_send((y == 0 ? 0x80 : 0xC0) + x, 0);
+}
+
+// Displays string on LCD
+void lcd_puts(const char* s) {
+	while (*s) lcd_send(*s++, 1);
+}
+
+// Clears LCD display
+void lcd_clear(void) {
+	lcd_send(0x01, 0);
+	_delay_ms(2);
+}
+
+// Initializes LCD in 4-bit mode
+void lcd_init(void) {
+	LCD_CTRL_DDR |= (1 << LCD_RS) | (1 << LCD_RW) | (1 << LCD_EN);
+	LCD_DATA_DDR |= 0x0F;
+	_delay_ms(50);
+	LCD_DATA_PORT = 0x03; lcd_enable(); _delay_ms(5);
+	LCD_DATA_PORT = 0x03; lcd_enable(); _delay_us(100);
+	LCD_DATA_PORT = 0x03; lcd_enable(); _delay_us(100);
+	LCD_DATA_PORT = 0x02; lcd_enable(); _delay_us(100);
+	uint8_t cmds[] = {0x28, 0x0C, 0x06, 0x01};
+	for (uint8_t i = 0; i < 4; i++) {
+		lcd_send(cmds[i], 0);
+		_delay_ms(2);
+	}
+}
+
+// Updates stopwatch display
+void update_display(void) {
+	if (!started) {
+		lcd_xy(0, 0); lcd_puts(" stopwatch  ");
+		lcd_xy(0, 1); lcd_puts("press to start");
+		} else {
+		if (minutes != last_minutes || seconds != last_seconds || hundredths != last_hundredths) {
+			lcd_xy(2, 0);
+			lcd_send((minutes / 10) + '0', 1);
+			lcd_send((minutes % 10) + '0', 1);
+			lcd_send(':', 1);
+			lcd_send((seconds / 10) + '0', 1);
+			lcd_send((seconds % 10) + '0', 1);
+			lcd_send(':', 1);
+			lcd_send((hundredths / 10) + '0', 1);
+			lcd_send((hundredths % 10) + '0', 1);
+			last_minutes = minutes;
+			last_seconds = seconds;
+			last_hundredths = hundredths;
+		}
+		lcd_xy(0, 1);
+		lcd_puts(running ? "RUNNING    " : "PAUSED     ");
+	}
+}
+
+// Timer1 interrupt handler - updates time every 10ms
+ISR(TIMER1_COMPA_vect) {
+	if (running) {
+		hundredths++;  // Increment hundredths every 10ms
+		if (hundredths >= 100) {  // When we reach 1 second
+			hundredths = 0;
+			seconds++;
+			if (seconds >= 60) {  // When we reach 1 minute
+				seconds = 0;
+				minutes++;
+				if (minutes >= 60) minutes = 0;  // Reset at 60 minutes
+			}
+		}
+		update_flag = 1;  // Signal main loop to update display
+	}
+}
+
+// Start/Resume button interrupt handler (PD2)
+ISR(INT0_vect) {
+	_delay_ms(20);
+	if (!(PIND & (1 << PD2)) && !running) {
+		if (!started) {
+			started = 1;
+			minutes = 0; seconds = 0; hundredths = 0;
+		}
+		last_minutes = 99; last_seconds = 99; last_hundredths = 99;
+		running = 1;
+		TCCR1B |= (1 << CS11) | (1 << CS10); // Prescaler 64
+		lcd_clear();
+		update_flag = 1;
+	}
+}
+
+// Pause button interrupt handler (PD3)
+ISR(INT1_vect) {
+	_delay_ms(20);
+	if (!(PIND & (1 << PD3)) && running) {
+		running = 0;
+		TCCR1B &= ~((1 << CS12) | (1 << CS11) | (1 << CS10));
+		update_flag = 1;
+	}
+}
+
+// Resets stopwatch to 00:00:00 and pauses
+void reset_stopwatch(void) {
+	minutes = 0;
+	seconds = 0;
+	hundredths = 0;
+	running = 0;  // Pause the timer
+	TCCR1B &= ~((1 << CS12) | (1 << CS11) | (1 << CS10));  // Stop timer by clearing prescaler bits
+	last_minutes = 99;  // Force display update
+	last_seconds = 99;
+	last_hundredths = 99;
+	update_flag = 1;
+}
+
+// Initializes start/resume button (PD2)
+void int0_init(void) {
+	DDRD &= ~(1 << PD2);
+	PORTD |= (1 << PD2);
+	MCUCR |= (1 << ISC01);
+	GICR |= (1 << INT0);
+}
+
+// Initializes pause button (PD3)
+void int1_init(void) {
+	DDRD &= ~(1 << PD3);
+	PORTD |= (1 << PD3);
+	MCUCR |= (1 << ISC11);
+	GICR |= (1 << INT1);
+}
+
+// Initializes reset button (PD0)
+void reset_init(void) {
+	DDRD &= ~(1 << PD0);  // Set PD0 as input
+	PORTD |= (1 << PD0);  // Enable pull-up
+}
+
+// Initializes Timer1 for 10ms interrupts
+void timer1_init(void) {
+	TCNT1 = 0;                        
+	OCR1A = 125;             
+	TCCR1B |= (1 << WGM12); 
+	TIMSK |= (1 << OCIE1A);  
+	TCCR1B &= ~((1 << CS12) | (1 << CS11) | (1 << CS10));  
+}
+
+int main(void) {
+	lcd_init();
+	int0_init();
+	int1_init();
+	reset_init();
+	timer1_init();
+	sei();
+	update_display();
+	
+	while (1) {
+		if (update_flag) {
+			update_flag = 0;
+			update_display();
+		}
+		
+		// Check reset button (PD0)
+		if (!(PIND & (1 << PD0))) {
+			_delay_ms(20);  // Debounce
+			if (!(PIND & (1 << PD0))) {
+				while (!(PIND & (1 << PD0)));  // Wait for release
+				_delay_ms(20);  // Debounce
+				reset_stopwatch();
+			}
+		}
+	}
+}
